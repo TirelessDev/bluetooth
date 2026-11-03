@@ -3,10 +3,12 @@
 package bluetooth
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/godbus/dbus/v5"
 	"github.com/godbus/dbus/v5/prop"
@@ -440,7 +442,17 @@ type Device struct {
 	adapter *Adapter       // the adapter that was used to form this device connection
 }
 
+// defaultConnectionTimeout bounds Connect when ConnectionParams.ConnectionTimeout
+// is unset, matching the darwin backend.
+const defaultConnectionTimeout = 10 * time.Second
+
+// disconnectTimeout bounds the D-Bus Disconnect call, which BlueZ can also leave
+// unanswered.
+const disconnectTimeout = 10 * time.Second
+
 // Connect starts a connection attempt to the given peripheral device address.
+// It gives up after params.ConnectionTimeout, or defaultConnectionTimeout if
+// that is unset.
 //
 // On Linux and Windows, the IsRandom part of the address is ignored.
 func (a *Adapter) Connect(address Address, params ConnectionParams) (Device, error) {
@@ -450,6 +462,16 @@ func (a *Adapter) Connect(address Address, params ConnectionParams) (Device, err
 		device:  a.bus.Object("org.bluez", devicePath),
 		adapter: a,
 	}
+
+	timeout := defaultConnectionTimeout
+	if params.ConnectionTimeout != 0 {
+		timeout = time.Duration(int64(params.ConnectionTimeout)*625) * time.Microsecond
+	}
+	// Every D-Bus call below shares this deadline. BlueZ can leave
+	// Device1.Connect unanswered indefinitely, and an unbounded call hangs the
+	// caller with it (tinygo-org/bluetooth#296).
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
 
 	// Already start watching for property changes. We do this before reading
 	// the Connected property below to avoid a race condition: if the device
@@ -462,62 +484,69 @@ func (a *Adapter) Connect(address Address, params ConnectionParams) (Device, err
 	a.bus.AddMatchSignal(propertiesChangedMatchOptions...)
 	defer a.bus.RemoveMatchSignal(propertiesChangedMatchOptions...)
 
-	powered, err := a.adapter.GetProperty("org.bluez.Adapter1.Powered")
+	// Drain the channel from the start, not only once Device1.Connect returns:
+	// godbus parks a goroutine for every signal a registered channel hasn't
+	// taken, so leaving it unread while a call blocks leaks memory for as long
+	// as the call does.
+	connectedCh := make(chan struct{}, 1)
+	poweredOffCh := make(chan struct{}, 1)
+	go func() {
+		for sig := range signal {
+			if sig.Name != dbusSignalPropertiesChanged {
+				continue
+			}
+			interfaceName, _ := sig.Body[dbusPropertiesChangedInterfaceName].(string)
+			changes, _ := sig.Body[dbusPropertiesChangedDictionary].(map[string]dbus.Variant)
+			switch interfaceName {
+			case "org.bluez.Adapter1":
+				if powered, ok := changes["Powered"].Value().(bool); ok && !powered {
+					notifyOnce(poweredOffCh)
+				}
+			case bluezDevice1Interface:
+				if sig.Path != device.device.Path() {
+					continue
+				}
+				if connected, ok := changes["Connected"].Value().(bool); ok && connected {
+					notifyOnce(connectedCh)
+				}
+			}
+		}
+	}()
+
+	powered, err := getProperty(ctx, a.adapter, "org.bluez.Adapter1.Powered")
 	if err != nil {
-		return Device{}, err
+		return Device{}, connectErr(ctx, timeout, err)
 	}
 	if !powered.Value().(bool) {
 		return Device{}, errAdaptorNotPowered
 	}
 
 	// Read whether this device is already connected.
-	connected, err := device.device.GetProperty("org.bluez.Device1.Connected")
+	connected, err := getProperty(ctx, device.device, "org.bluez.Device1.Connected")
 	if err != nil {
-		return Device{}, err
+		return Device{}, connectErr(ctx, timeout, err)
 	}
 
 	// Connect to the device, if not already connected.
 	if !connected.Value().(bool) {
-		// Start connecting (async).
-		err := device.device.Call("org.bluez.Device1.Connect", 0).Err
+		err := device.device.CallWithContext(ctx, "org.bluez.Device1.Connect", 0).Err
 		if err != nil {
-			return Device{}, fmt.Errorf("bluetooth: failed to connect: %w", err)
+			if ctx.Err() != nil {
+				abandonConnect(device.device)
+			}
+			return Device{}, connectErr(ctx, timeout, fmt.Errorf("bluetooth: failed to connect: %w", err))
 		}
 
 		// Wait until the device has connected.
-		connectChan := make(chan struct{})
-		go func() {
-			for sig := range signal {
-				switch sig.Name {
-				case "org.freedesktop.DBus.Properties.PropertiesChanged":
-					interfaceName := sig.Body[0].(string)
-					switch interfaceName {
-					case "org.bluez.Adapter1":
-						// check power state
-						changes := sig.Body[1].(map[string]dbus.Variant)
-						for k, v := range changes {
-							if k == "Powered" && !v.Value().(bool) {
-								// adapter is powered off, stop the scan
-								err = errAdaptorNotPowered
-								close(connectChan)
-							}
-						}
-					case "org.bluez.Device1":
-						if sig.Path != device.device.Path() {
-							continue
-						}
-						changes := sig.Body[1].(map[string]dbus.Variant)
-						if connected, ok := changes["Connected"].Value().(bool); ok && connected {
-							close(connectChan)
-						}
-					}
-				}
+		if !connectedNow(ctx, device.device, connectedCh) {
+			select {
+			case <-connectedCh:
+			case <-poweredOffCh:
+				return Device{}, errAdaptorNotPowered
+			case <-ctx.Done():
+				abandonConnect(device.device)
+				return Device{}, connectErr(ctx, timeout, ctx.Err())
 			}
-		}()
-		<-connectChan
-
-		if err != nil {
-			return Device{}, err
 		}
 	}
 
@@ -526,6 +555,64 @@ func (a *Adapter) Connect(address Address, params ConnectionParams) (Device, err
 	}
 
 	return device, nil
+}
+
+// notifyOnce signals ch without blocking; ch has a buffer of one, so later
+// signals are dropped once the first is pending.
+func notifyOnce(ch chan struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
+// connectedNow reports whether the device is already connected once
+// Device1.Connect has returned: either the Connected change has been signalled,
+// or the property says so. The second check covers a device that connected
+// between Connect's first read of the property and the call, for which no
+// change is signalled and waiting would only run out the timeout.
+func connectedNow(ctx context.Context, device dbus.BusObject, connectedCh chan struct{}) bool {
+	select {
+	case <-connectedCh:
+		return true
+	default:
+	}
+	c, err := getProperty(ctx, device, "org.bluez.Device1.Connected")
+	if err != nil {
+		return false
+	}
+	connected, _ := c.Value().(bool)
+	return connected
+}
+
+// connectErr reports err, or a timeout error if the connect deadline is what
+// ended the attempt.
+func connectErr(ctx context.Context, timeout time.Duration, err error) error {
+	if ctx.Err() == context.DeadlineExceeded {
+		return fmt.Errorf("bluetooth: timeout on Connect after %s", timeout)
+	}
+	return err
+}
+
+// abandonConnect asks BlueZ to drop a connection attempt we've given up on, so
+// it doesn't complete later behind the caller's back. Device1.Disconnect also
+// cancels a pending Connect.
+func abandonConnect(device dbus.BusObject) {
+	ctx, cancel := context.WithTimeout(context.Background(), disconnectTimeout)
+	defer cancel()
+	device.CallWithContext(ctx, "org.bluez.Device1.Disconnect", 0)
+}
+
+// getProperty is BusObject.GetProperty bounded by ctx; godbus has no context
+// variant of it.
+func getProperty(ctx context.Context, obj dbus.BusObject, p string) (dbus.Variant, error) {
+	idx := strings.LastIndex(p, ".")
+	if idx == -1 || idx+1 == len(p) {
+		return dbus.Variant{}, errors.New("dbus: invalid property " + p)
+	}
+	var v dbus.Variant
+	err := obj.CallWithContext(ctx, "org.freedesktop.DBus.Properties.Get", 0, p[:idx], p[idx+1:]).Store(&v)
+	return v, err
 }
 
 // Disconnect from the BLE device. This method is non-blocking and does not
@@ -537,7 +624,9 @@ func (d Device) Disconnect() error {
 
 	// we don't call our cancel function here, instead we wait for the
 	// property change in `watchForConnect` and cancel things then
-	return d.device.Call("org.bluez.Device1.Disconnect", 0).Err
+	ctx, cancel := context.WithTimeout(context.Background(), disconnectTimeout)
+	defer cancel()
+	return d.device.CallWithContext(ctx, "org.bluez.Device1.Disconnect", 0).Err
 }
 
 // Connected returns whether the device is currently connected.

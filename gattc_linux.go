@@ -3,6 +3,7 @@
 package bluetooth
 
 import (
+	"context"
 	"errors"
 	"sort"
 	"strings"
@@ -19,6 +20,11 @@ var (
 var (
 	errDupNotif = errors.New("unclosed notifications")
 )
+
+// notifyTimeout bounds the StartNotify and StopNotify calls. BlueZ doesn't
+// always answer them when the link is failing, and without a deadline the
+// caller would wait forever.
+const notifyTimeout = 10 * time.Second
 
 // UUIDWrapper is a type alias for UUID so we ensure no conflicts with
 // struct method of the same name.
@@ -258,18 +264,17 @@ func (c *DeviceCharacteristic) EnableNotifications(callback func(buf []byte)) er
 		}
 
 		// Start watching for changes in the Value property.
-		c.property = make(chan *dbus.Signal)
-		c.adapter.bus.Signal(c.property)
-		c.propertiesChangedMatchOption = dbus.WithMatchInterface("org.freedesktop.DBus.Properties")
-		c.adapter.bus.AddMatchSignal(c.propertiesChangedMatchOption)
+		property := make(chan *dbus.Signal)
+		c.adapter.bus.Signal(property)
+		matchOption := dbus.WithMatchInterface("org.freedesktop.DBus.Properties")
+		c.adapter.bus.AddMatchSignal(matchOption)
 
-		err := c.characteristic.Call("org.bluez.GattCharacteristic1.StartNotify", 0).Err
-		if err != nil {
-			return err
-		}
-
+		// Read the channel from the moment it is registered. godbus hands every
+		// signal on the bus to every registered channel, and parks a goroutine
+		// for each one a channel isn't ready to take, so a channel nobody reads
+		// grows memory for as long as it stays registered.
 		go func() {
-			for sig := range c.property {
+			for sig := range property {
 				if sig.Name == "org.freedesktop.DBus.Properties.PropertiesChanged" {
 					interfaceName := sig.Body[0].(string)
 					if interfaceName != "org.bluez.GattCharacteristic1" {
@@ -286,6 +291,20 @@ func (c *DeviceCharacteristic) EnableNotifications(callback func(buf []byte)) er
 			}
 		}()
 
+		ctx, cancel := context.WithTimeout(context.Background(), notifyTimeout)
+		defer cancel()
+		err := c.characteristic.CallWithContext(ctx, "org.bluez.GattCharacteristic1.StartNotify", 0).Err
+		if err != nil {
+			// Unregister the channel, or it stays registered for the life of
+			// the connection to the bus with nothing to disable it.
+			c.adapter.bus.RemoveMatchSignal(matchOption)
+			c.adapter.bus.RemoveSignal(property)
+			close(property)
+			return err
+		}
+
+		c.property = property
+		c.propertiesChangedMatchOption = matchOption
 		return nil
 
 	case nil:
@@ -293,7 +312,9 @@ func (c *DeviceCharacteristic) EnableNotifications(callback func(buf []byte)) er
 			return nil
 		}
 		// Make the D-Bus call to stop notifications on the characteristic.
-		stopNotifyErr := c.characteristic.Call("org.bluez.GattCharacteristic1.StopNotify", 0).Err
+		ctx, cancel := context.WithTimeout(context.Background(), notifyTimeout)
+		defer cancel()
+		stopNotifyErr := c.characteristic.CallWithContext(ctx, "org.bluez.GattCharacteristic1.StopNotify", 0).Err
 		// Still clean up other resources if there was an error
 		removeSignalErr := c.adapter.bus.RemoveMatchSignal(c.propertiesChangedMatchOption)
 		c.adapter.bus.RemoveSignal(c.property)
